@@ -1,4 +1,5 @@
 import os, smtplib, ssl, datetime as dt
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +27,7 @@ OUT_DIR     = os.environ.get("OUT_DIR", "etf100_outputs")
 REPORT_XLSX = os.environ.get("REPORT_XLSX", "ETF100_report.xlsx")
 Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
 
+# === 指標計算 ===
 def ema(s, n): return s.ewm(span=n, adjust=False).mean()
 def sma(s, n): return s.rolling(n).mean()
 
@@ -45,27 +47,37 @@ def calc_dmi(df, n=14):
 def calc_indicators(df):
     out = pd.DataFrame(index=df.index)
     out[["Open","High","Low","Close","Volume"]] = df[["Open","High","Low","Close","Volume"]]
+    # MACD
     out["MACD"] = ema(out["Close"],12) - ema(out["Close"],26)
     out["MACD_signal"] = ema(out["MACD"],9)
     out["MACD_hist"] = out["MACD"] - out["MACD_signal"]
+    # KDJ
     low14, high14 = out["Low"].rolling(14).min(), out["High"].rolling(14).max()
     out["%K"] = 100*(out["Close"]-low14)/(high14-low14)
     out["%D"] = out["%K"].rolling(3).mean()
     out["J"]  = 3*out["%D"] - 2*out["%K"]
+    # RSI(14)
     delta = out["Close"].diff()
     gain = delta.clip(lower=0).rolling(14).mean()
     loss = -delta.clip(upper=0).rolling(14).mean()
     rs = gain / loss.replace(0, np.nan)
     out["RSI"] = 100 - (100/(1+rs))
+    # OBV
     out["OBV"] = (np.sign(out["Close"].diff().fillna(0)) * out["Volume"]).fillna(0).cumsum()
+    # PSY(12)
     out["PSY"] = 100 * (out["Close"].diff() > 0).astype(int).rolling(12).mean()
+    # W%R(14)
     out["W%R"] = -100*(high14 - out["Close"])/(high14-low14)
+    # BIAS
     out["BIAS6"]  = (out["Close"]/sma(out["Close"],6)  - 1)*100
     out["BIAS12"] = (out["Close"]/sma(out["Close"],12) - 1)*100
     out["BIAS24"] = (out["Close"]/sma(out["Close"],24) - 1)*100
+    # VWAP 近似
     tp = (out["High"] + out["Low"] + out["Close"]) / 3.0
     out["VWAP"] = (tp*out["Volume"]).cumsum()/out["Volume"].cumsum().replace(0,np.nan)
+    # DMI
     out["+DI"], out["-DI"], out["ADX"] = calc_dmi(out, 14)
+    # MAs
     out["MA3"], out["MA5"], out["MA10"] = sma(out["Close"],3), sma(out["Close"],5), sma(out["Close"],10)
     return out
 
@@ -84,7 +96,9 @@ def make_chart(sym, dfi, out_path, last_n=60):
     gs = fig.add_gridspec(6,1,hspace=0.4)
     ax1 = fig.add_subplot(gs[0:2,0])
     ax1.plot(d.index,d["Close"],label="Close"); ax1.plot(d.index,d["MA3"],label="MA3"); ax1.plot(d.index,d["MA5"],label="MA5"); ax1.plot(d.index,d["MA10"],label="MA10"); ax1.plot(d.index,d["VWAP"],label="VWAP")
-    ax1.grid(alpha=0.2); ax1.legend(loc="upper left"); ax1_t=ax1.twinx(); ax1_t.bar(d.index,d["Volume"],alpha=0.3,label="Volume"); ax1_t.legend(loc="upper right"); ax1.set_title(f"{sym} - Price/MA/VWAP")
+    ax1.grid(alpha=0.2); ax1.legend(loc="upper left")
+    ax1_t=ax1.twinx(); ax1_t.bar(d.index,d["Volume"],alpha=0.3,label="Volume"); ax1_t.legend(loc="upper right")
+    ax1.set_title(f"{sym} - Price/MA/VWAP")
     ax2 = fig.add_subplot(gs[2,0]); ax2.plot(d.index,d["MACD"],label="MACD(DIF)"); ax2.plot(d.index,d["MACD_signal"],label="Signal"); ax2.bar(d.index,d["MACD_hist"],label="Hist"); ax2.grid(alpha=0.2); ax2.legend(loc="upper left"); ax2.set_title("MACD")
     ax3 = fig.add_subplot(gs[3,0]); ax3.plot(d.index,d["+DI"],label="+DI"); ax3.plot(d.index,d["-DI"],label="-DI"); ax3.plot(d.index,d["ADX"],label="ADX"); ax3.grid(alpha=0.2); ax3.legend(loc="upper left"); ax3.set_title("DMI")
     ax4 = fig.add_subplot(gs[4,0]); ax4.plot(d.index,d["%K"],label="%K"); ax4.plot(d.index,d["%D"],label="%D"); ax4.plot(d.index,d["J"],label="J"); ax4.plot(d.index,d["RSI"],label="RSI"); ax4.grid(alpha=0.2); ax4.legend(loc="upper left"); ax4.set_title("KDJ & RSI")
@@ -93,7 +107,9 @@ def make_chart(sym, dfi, out_path, last_n=60):
 
 def send_email(subject, body, attachments):
     msg = MIMEMultipart()
-    msg["From"] = SENDER_EMAIL; msg["To"] = ", ".join(RECIPIENTS); msg["Subject"] = subject
+    msg["From"] = SENDER_EMAIL
+    msg["To"]   = ", ".join(RECIPIENTS)
+    msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain", "utf-8"))
     for p in attachments:
         with open(p,"rb") as f:
@@ -119,8 +135,10 @@ def load_tickers_from_sheet(url):
     return out
 
 def main():
+    # 讀清單
     symbols = load_tickers_from_sheet(GOOGLE_SHEET_CSV)
     if TEST_FIRST_N: symbols = symbols[:TEST_FIRST_N]
+
     rows=[]
     for sym in symbols:
         try:
@@ -139,18 +157,27 @@ def main():
             print(sym,"完成")
         except Exception as e:
             print(sym,"錯誤：",e)
+
+    # 報表
     report = pd.DataFrame(rows).sort_values(["Score","Symbol"], ascending=[False,True])
     report_path = os.path.join(OUT_DIR, REPORT_XLSX)
     report.to_excel(report_path, index=False)
     print("報表：", report_path)
     print("Top 20 預覽：\n", report.head(20).to_string(index=False))
+
+    # 寄信主旨與內容 + 寄送時間（台灣）
     today = dt.datetime.now().strftime("%Y-%m-%d")
-    subject=f"ETF100 智勝簡訊（GitHub Actions） - {today}"
-    body=f"附上 {today} 的篩選報表與圖表。"
-    atts=[report_path]+[str(Path(OUT_DIR)/f) for f in os.listdir(OUT_DIR) if f.endswith(".png")]
+    subject = f"ETF100 智勝簡訊（GitHub Actions） - {today}"
+    taipei_now = dt.datetime.now(ZoneInfo("Asia/Taipei")).strftime("%Y-%m-%d %H:%M:%S")
+    body = (
+        f"附上 {today} 的篩選報表與圖表。\n"
+        f"（本信由 GitHub Actions 自動寄送）"
+        f"\n\n---\n寄送時間（台灣時間）：{taipei_now}"
+    )
+
+    atts = [report_path] + [str(Path(OUT_DIR)/f) for f in os.listdir(OUT_DIR) if f.endswith(".png")]
     send_email(subject, body, atts)
     print("Email 已嘗試寄出。")
 
 if __name__ == "__main__":
     main()
-#test commit
